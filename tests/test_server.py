@@ -26,11 +26,15 @@ def ensure_samples():
 
 
 def test_list_resumes_reports_failures():
+    from resume_screener.ocr import ocr_available
+
     out = list_resumes(SAMPLES)
     assert out["ok"] and out["parsed"] >= 8
     reasons = {f["filename"]: f["reason"] for f in out["failed"]}
-    assert "scanned_resume.pdf" in reasons
+    # The legacy .doc is always unreadable; the scanned PDF only when OCR is off.
     assert "old_resume.doc" in reasons
+    if not ocr_available():
+        assert "scanned_resume.pdf" in reasons
 
 
 def test_list_resumes_bad_folder():

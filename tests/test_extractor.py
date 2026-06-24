@@ -48,9 +48,15 @@ def test_docx_table_captured():
 
 
 def test_scanned_pdf_reported_not_dropped():
+    from resume_screener.ocr import ocr_available
+
     rec = extract_resume(_path("scanned_resume.pdf"))
-    assert rec["ok"] is False
-    assert "scanned" in rec["error"].lower() or "no extractable text" in rec["error"].lower()
+    if ocr_available():
+        # OCR may rescue it (extracted_via=ocr); if not, it's reported, never dropped.
+        assert rec["ok"] or "no extractable text" in rec["error"].lower()
+    else:
+        assert rec["ok"] is False
+        assert "scanned" in rec["error"].lower() or "no extractable text" in rec["error"].lower()
 
 
 def test_legacy_doc_reported():
