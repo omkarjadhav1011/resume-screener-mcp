@@ -1,9 +1,13 @@
 import logging
 import os
+import re
+from datetime import datetime
 
 from fastmcp import FastMCP
 
 from resume_screener.anonymize import anonymize_text
+from resume_screener.collect import collect_resumes
+from resume_screener.export import WRITERS
 from resume_screener.extractor import extract_resume, find_resume_files
 from resume_screener.knockout import apply_knockouts
 from resume_screener.prefilter import prefilter
@@ -587,6 +591,132 @@ def rerank(
         f"score: {emphasis}"
     )
     return packet
+
+
+def _enrich_rows(results: list[dict], folder: str) -> list[dict]:
+    """Fill missing email/years_experience on each row from the resume's parsed
+    fields, matched by filename. Best-effort: if the folder is unreadable or a
+    filename doesn't match, the row is returned unchanged."""
+    resume_paths, _legacy, error = find_resume_files(folder)
+    if error:
+        return results
+    by_name = {os.path.basename(p): p for p in resume_paths}
+    out: list[dict] = []
+    for r in results:
+        row = dict(r)
+        path = by_name.get(row.get("filename"))
+        if path:
+            rec = _extract_cached(path)
+            fields = (rec.get("fields") or {}) if rec.get("ok") else {}
+            if "email" not in row and fields.get("email"):
+                row["email"] = fields["email"]
+            if "years_experience" not in row and fields.get("years_experience") is not None:
+                row["years_experience"] = fields["years_experience"]
+        out.append(row)
+    return out
+
+
+@mcp.tool
+def export_shortlist(
+    results: list[dict],
+    out_path: str,
+    fmt: str = "csv",
+    folder: str | None = None,
+) -> dict:
+    """Save a judged shortlist to a CSV or XLSX file for the recruiter.
+
+    Call this AFTER you (Claude Code) have produced the ranked results. The
+    server only formats and writes the file — it does NOT score.
+
+    Args:
+        results: The judged, ranked candidates (highest first). Each is an object
+            like {"filename", "score", "reason"} and may add "rank"/"email"/
+            "years_experience". 'filename' is required on every row.
+        out_path: Absolute path for the output file; its parent folder must exist.
+        fmt: "csv" (default) or "xlsx".
+        folder: Optional source folder of the resumes — if given, missing
+            email/years_experience columns are filled from each resume's parsed
+            fields.
+
+    Returns the absolute path written plus row count, or a structured error."""
+    n = len(results) if isinstance(results, list) else -1
+    log.info("export_shortlist called: %s (fmt=%s, rows=%s)", out_path, fmt, n)
+
+    fmt = (fmt or "").lower()
+    if fmt not in WRITERS:
+        return {"ok": False, "error": f"Unsupported format {fmt!r} — use 'csv' or 'xlsx'."}
+    if not isinstance(results, list) or not results:
+        return {"ok": False, "error": "Provide a non-empty list of judged results to export."}
+    if not all(isinstance(r, dict) for r in results):
+        return {"ok": False, "error": "Each result must be an object (e.g. {\"filename\":..., \"score\":..., \"reason\":...})."}
+    if not all("filename" in r for r in results):
+        return {
+            "ok": False,
+            "error": "Every result needs at least a 'filename'. Example row: "
+                     "{\"filename\": \"alice.pdf\", \"score\": 90, \"reason\": \"...\"}.",
+        }
+
+    abspath = os.path.abspath(out_path)
+    parent = os.path.dirname(abspath)
+    if parent and not os.path.isdir(parent):
+        return {"ok": False, "error": f"The output folder doesn't exist: {parent}"}
+
+    rows = _enrich_rows(results, folder) if folder else results
+    try:
+        written = WRITERS[fmt](rows, abspath)
+    except Exception as exc:
+        return {"ok": False, "error": f"Couldn't write the file ({type(exc).__name__}): {exc}"}
+
+    return {
+        "ok": True,
+        "path": written,
+        "rows": len(rows),
+        "format": fmt,
+        "enriched": bool(folder),
+    }
+
+
+def _safe_label(label: str) -> str:
+    """Make a free-text label safe for a folder name."""
+    cleaned = re.sub(r"[^A-Za-z0-9._-]+", "-", label.strip()).strip("-")
+    return cleaned or "selected"
+
+
+@mcp.tool
+def collect_selected(
+    folder: str,
+    filenames: list[str],
+    dest_folder: str | None = None,
+    role_label: str | None = None,
+) -> dict:
+    """Copy the chosen candidates' resume files into a new folder so the recruiter
+    has the shortlist in one place. Call this AFTER you (Claude Code) have decided
+    the shortlist. The server only copies files — it does not choose candidates.
+
+    Args:
+        folder: Source folder the resumes were screened from.
+        filenames: The selected resume filenames (as returned by a screen, e.g.
+            ["alice_backend.pdf", "henry_principal.pdf"]).
+        dest_folder: Where to copy them. If omitted, defaults to
+            '<folder>/selected/<role_label or timestamp>'.
+        role_label: Optional label used to name the default destination folder
+            (e.g. "backend-finalists").
+
+    Returns {ok, dest, copied, not_found, skipped}. Existing files are skipped and
+    reported, never overwritten; unknown names appear in not_found."""
+    log.info("collect_selected called: %s -> %s", filenames, dest_folder)
+
+    if not filenames or not isinstance(filenames, list):
+        return {"ok": False, "error": "Name at least one resume file to collect."}
+
+    if dest_folder is None:
+        label = (
+            _safe_label(role_label) if role_label
+            else datetime.now().strftime("%Y%m%d-%H%M%S")
+        )
+        dest_folder = os.path.join(folder, "selected", label)
+
+    return collect_resumes(folder, filenames, dest_folder)
 
 
 def main() -> None:
