@@ -3,6 +3,7 @@ import os
 
 from fastmcp import FastMCP
 
+from resume_screener.anonymize import anonymize_text
 from resume_screener.extractor import extract_resume, find_resume_files
 from resume_screener.prefilter import prefilter
 
@@ -31,6 +32,17 @@ SCORING_RUBRIC = (
 # Above this many parseable resumes, returning every full text in one packet is
 # unwieldy — the caller should use screen_resumes_bulk (TF-IDF pre-filter first).
 SINGLE_STAGE_MAX = 25
+
+# Returned in every anonymized packet so Claude scores blind and honestly.
+FAIRNESS_NOTE = (
+    "ANONYMIZED MODE: candidate names, emails, phones, links, and listed schools "
+    "were removed from the text BEFORE you received it; each candidate is labeled "
+    "with an opaque id (candidate_NN). Score PURELY from the anonymized text. Use "
+    "id_map only to map your final ranking back to real files for the recruiter — "
+    "do not let it influence scoring. Honest caveat: this removes direct "
+    "identifiers but cannot remove every indirect signal (writing style, gendered "
+    "phrasing), so it reduces bias risk but is not provably bias-free."
+)
 
 
 # In-memory extraction cache. The server is a long-lived process, so caching
@@ -71,6 +83,42 @@ def _clamp_top_k(top_k: int, count: int) -> tuple[int, str | None]:
             f"instead of the requested {top_k}."
         )
     return top_k, None
+
+
+def _build_candidates(
+    records: list[dict], anonymize: bool, include_prefilter: bool = False
+) -> tuple[list[dict], dict | None]:
+    """Build the packet's candidate list from extract records.
+
+    Plain mode → {filename, text} (unchanged from before). Anonymized mode →
+    each candidate's text is redacted via fields, filename becomes an opaque
+    'candidate_NN', and a separate id_map (opaque id → real filename) is returned
+    so results can be de-anonymized AFTER judging. Returns (candidates, id_map);
+    id_map is None when not anonymizing."""
+    candidates: list[dict] = []
+    id_map: dict | None = {} if anonymize else None
+    for i, r in enumerate(records, 1):
+        if anonymize:
+            text, _counts = anonymize_text(r["text"], r.get("fields") or {})
+            label = f"candidate_{i:02d}"
+            id_map[label] = r["filename"]
+        else:
+            text = r["text"]
+            label = r["filename"]
+        candidate = {"filename": label, "text": text}
+        if include_prefilter:
+            candidate["prefilter_score"] = r.get("prefilter_score")
+        candidates.append(candidate)
+    return candidates, id_map
+
+
+def _add_anonymization_meta(packet: dict, id_map: dict | None) -> dict:
+    """Attach anonymization metadata to a packet when id_map is present."""
+    if id_map is not None:
+        packet["anonymized"] = True
+        packet["id_map"] = id_map
+        packet["fairness_note"] = FAIRNESS_NOTE
+    return packet
 
 
 def _gather_resumes(folder: str) -> tuple[list[dict], list[dict], str | None]:
@@ -155,7 +203,9 @@ def list_resumes(folder: str) -> dict:
 
 
 @mcp.tool
-def screen_resumes(folder: str, job_description: str, top_k: int = 5) -> dict:
+def screen_resumes(
+    folder: str, job_description: str, top_k: int = 5, anonymize: bool = False
+) -> dict:
     """Prepare resumes from a folder to be screened against a job description.
 
     This tool extracts and returns the cleaned text of every parseable resume
@@ -175,10 +225,18 @@ def screen_resumes(folder: str, job_description: str, top_k: int = 5) -> dict:
         folder: Absolute path to the folder of resumes.
         job_description: The full JD text to screen against.
         top_k: How many top candidates to return (default 5).
+        anonymize: If True, names/emails/phones/links/schools are REMOVED from
+            each candidate's text before you see it, and candidates are labeled
+            candidate_NN. The packet then includes an id_map (candidate_NN → real
+            filename) and a fairness_note. Score from the anonymized text; use
+            id_map only to report results. Use this for bias-resistant screening.
 
     Returns a judging packet: the JD, the scoring rubric, and a list of
     candidates each with filename and extracted text."""
-    log.info("screen_resumes called: %s (top_k=%s)", folder, top_k)
+    log.info(
+        "screen_resumes called: %s (top_k=%s, anonymize=%s)",
+        folder, top_k, anonymize,
+    )
 
     if not job_description or not job_description.strip():
         return {
@@ -210,9 +268,7 @@ def screen_resumes(folder: str, job_description: str, top_k: int = 5) -> dict:
             "candidate_count": len(ok_records),
         }
 
-    candidates = [
-        {"filename": r["filename"], "text": r["text"]} for r in ok_records
-    ]
+    candidates, id_map = _build_candidates(ok_records, anonymize)
     effective_top_k, top_k_note = _clamp_top_k(top_k, len(candidates))
     packet = {
         "ok": True,
@@ -225,7 +281,7 @@ def screen_resumes(folder: str, job_description: str, top_k: int = 5) -> dict:
     }
     if top_k_note:
         packet["top_k_note"] = top_k_note
-    return packet
+    return _add_anonymization_meta(packet, id_map)
 
 
 @mcp.tool
@@ -234,6 +290,7 @@ def screen_resumes_bulk(
     job_description: str,
     top_k: int = 5,
     shortlist_size: int = 25,
+    anonymize: bool = False,
 ) -> dict:
     """Screen a LARGE folder of resumes (dozens to ~200) against a JD.
 
@@ -253,13 +310,16 @@ def screen_resumes_bulk(
         job_description: The full JD text to screen against.
         top_k: How many top candidates to return after judging (default 5).
         shortlist_size: How many resumes survive the pre-filter (default 25).
+        anonymize: If True, redact names/emails/phones/links/schools from the
+            shortlisted texts and label candidates candidate_NN; the packet then
+            includes id_map and a fairness_note (see screen_resumes).
 
     Returns a judging packet (JD, rubric, shortlisted candidates with text and a
     prefilter_score) plus pre-filter metadata: total_extracted, shortlisted,
     prefiltered_out."""
     log.info(
-        "screen_resumes_bulk called: %s (top_k=%s, shortlist=%s)",
-        folder, top_k, shortlist_size,
+        "screen_resumes_bulk called: %s (top_k=%s, shortlist=%s, anonymize=%s)",
+        folder, top_k, shortlist_size, anonymize,
     )
 
     if not job_description or not job_description.strip():
@@ -285,14 +345,9 @@ def screen_resumes_bulk(
     shortlisted = prefilter(ok_records, job_description, shortlist_size)
     prefiltered_out = total_extracted - len(shortlisted)
 
-    candidates = [
-        {
-            "filename": r["filename"],
-            "text": r["text"],
-            "prefilter_score": r["prefilter_score"],
-        }
-        for r in shortlisted
-    ]
+    candidates, id_map = _build_candidates(
+        shortlisted, anonymize, include_prefilter=True
+    )
     effective_top_k, top_k_note = _clamp_top_k(top_k, len(candidates))
     packet = {
         "ok": True,
@@ -315,12 +370,15 @@ def screen_resumes_bulk(
     }
     if top_k_note:
         packet["top_k_note"] = top_k_note
-    return packet
+    return _add_anonymization_meta(packet, id_map)
 
 
 @mcp.tool
 def compare_candidates(
-    folder: str, filenames: list[str], job_description: str
+    folder: str,
+    filenames: list[str],
+    job_description: str,
+    anonymize: bool = False,
 ) -> dict:
     """Return the full extracted text of 2-4 named candidates side by side,
     with the JD, so YOU (Claude Code) can compare them in depth against the
@@ -332,10 +390,14 @@ def compare_candidates(
         filenames: The 2-4 candidate filenames to compare (as returned by a
             previous screen, e.g. ["alice_backend.pdf", "henry_principal.pdf"]).
         job_description: The JD text to compare them against.
+        anonymize: If True, redact identity from each candidate's text and label
+            them candidate_NN; the packet then includes id_map and a
+            fairness_note (see screen_resumes). not_found echoes the names you
+            supplied and is never anonymized.
 
     Returns a comparison packet: the JD, the rubric, and each requested
     candidate's full text (or a not-found/unreadable note per file)."""
-    log.info("compare_candidates called: %s", filenames)
+    log.info("compare_candidates called: %s (anonymize=%s)", filenames, anonymize)
 
     if not job_description or not job_description.strip():
         return {
@@ -362,26 +424,36 @@ def compare_candidates(
 
     compared: list[dict] = []
     not_found: list[str] = []
+    id_map: dict | None = {} if anonymize else None
+    idx = 0
     for name in filenames:
         path = by_name.get(name)
         if path is None:
             not_found.append(name)
             continue
         record = _extract_cached(path)
+        idx += 1
+        label = f"candidate_{idx:02d}" if anonymize else name
+        if anonymize:
+            id_map[label] = name
         if record["ok"]:
-            compared.append({"filename": name, "text": record["text"]})
+            text = record["text"]
+            if anonymize:
+                text, _counts = anonymize_text(text, record.get("fields") or {})
+            compared.append({"filename": label, "text": text})
         else:
             compared.append(
-                {"filename": name, "text": "", "error": record["error"]}
+                {"filename": label, "text": "", "error": record["error"]}
             )
 
-    return {
+    packet = {
         "ok": True,
         "job_description": job_description,
         "scoring_rubric": SCORING_RUBRIC,
         "candidates": compared,
         "not_found": not_found,
     }
+    return _add_anonymization_meta(packet, id_map)
 
 
 @mcp.tool
@@ -391,6 +463,7 @@ def rerank(
     emphasis: str,
     top_k: int = 5,
     shortlist_size: int = 25,
+    anonymize: bool = False,
 ) -> dict:
     """Re-screen with an adjusted priority. 'emphasis' is a free-text
     instruction like 'weight cloud/AWS experience more heavily' or 'prioritize
@@ -405,9 +478,11 @@ def rerank(
         emphasis: Free-text re-ranking priority to apply on top of the JD.
         top_k: How many top candidates to return (default 5).
         shortlist_size: How many resumes survive the pre-filter (default 25).
+        anonymize: If True, redact identity and label candidates candidate_NN
+            (see screen_resumes); passed through to the underlying screen.
 
     Reuses the extraction cache, so re-ranks are fast."""
-    log.info("rerank called: emphasis=%r", emphasis)
+    log.info("rerank called: emphasis=%r (anonymize=%s)", emphasis, anonymize)
 
     if not emphasis or not emphasis.strip():
         return {
@@ -419,7 +494,8 @@ def rerank(
     # the new priority isn't pre-filtered out. Bias the JD with the emphasis.
     biased_jd = f"{job_description}\n\nEMPHASIS: {emphasis}"
     packet = screen_resumes_bulk(
-        folder, biased_jd, top_k=top_k, shortlist_size=shortlist_size
+        folder, biased_jd, top_k=top_k, shortlist_size=shortlist_size,
+        anonymize=anonymize,
     )
     if not packet.get("ok"):
         return packet
