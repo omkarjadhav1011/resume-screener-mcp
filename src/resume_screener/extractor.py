@@ -19,6 +19,8 @@ import unicodedata
 
 from pypdf import PdfReader
 
+from resume_screener.fields import parse_fields
+
 # Below this many characters, normalized text is treated as "no real text"
 # (almost always a scanned/image PDF or an effectively empty file). OCR is out
 # of scope, so we report it rather than pretending we read a resume.
@@ -148,6 +150,10 @@ def extract_resume(path: str) -> dict:
     record["text"] = clean
     record["char_count"] = len(clean)
     record["ok"] = True
+    # Additive: attach cheap structured fields (name/email/phone/links/years).
+    # Skills stay empty here — they're computed on demand against a JD-derived
+    # vocabulary by later tools. Never breaks existing record consumers.
+    record["fields"] = parse_fields(clean)
     return record
 
 
