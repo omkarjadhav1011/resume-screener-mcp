@@ -5,6 +5,7 @@ from fastmcp import FastMCP
 
 from resume_screener.anonymize import anonymize_text
 from resume_screener.extractor import extract_resume, find_resume_files
+from resume_screener.knockout import apply_knockouts
 from resume_screener.prefilter import prefilter
 
 # Logs go to STDERR by default — NEVER stdout. Stdout is the MCP transport;
@@ -121,6 +122,45 @@ def _add_anonymization_meta(packet: dict, id_map: dict | None) -> dict:
     return packet
 
 
+def _partition_knockouts(
+    records: list[dict], knockouts: dict | None
+) -> tuple[list[dict], list[dict], list[dict]]:
+    """Split records into those that clear the hard rules and those that don't.
+
+    Returns (passed, knocked_out, warnings). `knocked_out` entries are
+    {filename, reasons}; `warnings` are {filename, warnings} for indeterminate
+    cases that were NOT dropped (never silently lose a resume). With no rules,
+    everyone passes."""
+    if not knockouts:
+        return records, [], []
+    passed: list[dict] = []
+    knocked_out: list[dict] = []
+    warnings: list[dict] = []
+    for r in records:
+        ok, reasons, warns = apply_knockouts(r, knockouts)
+        if warns:
+            warnings.append({"filename": r["filename"], "warnings": warns})
+        if ok:
+            passed.append(r)
+        else:
+            knocked_out.append({"filename": r["filename"], "reasons": reasons})
+    return passed, knocked_out, warnings
+
+
+def _add_knockout_meta(
+    packet: dict, knockouts: dict | None,
+    knocked_out: list[dict], warnings: list[dict],
+) -> dict:
+    """Attach knockout results to a packet when rules were applied. The
+    knocked_out list is ALWAYS present when rules ran — knocked-out candidates
+    are surfaced for review, never silently dropped."""
+    if knockouts:
+        packet["knocked_out"] = knocked_out
+        if warnings:
+            packet["knockout_warnings"] = warnings
+    return packet
+
+
 def _gather_resumes(folder: str) -> tuple[list[dict], list[dict], str | None]:
     """Extract every resume in a folder. Returns (ok_records, failures, error).
 
@@ -204,7 +244,11 @@ def list_resumes(folder: str) -> dict:
 
 @mcp.tool
 def screen_resumes(
-    folder: str, job_description: str, top_k: int = 5, anonymize: bool = False
+    folder: str,
+    job_description: str,
+    top_k: int = 5,
+    anonymize: bool = False,
+    knockouts: dict | None = None,
 ) -> dict:
     """Prepare resumes from a folder to be screened against a job description.
 
@@ -230,6 +274,13 @@ def screen_resumes(
             candidate_NN. The packet then includes an id_map (candidate_NN → real
             filename) and a fairness_note. Score from the anonymized text; use
             id_map only to report results. Use this for bias-resistant screening.
+        knockouts: Optional hard-requirement rules applied DETERMINISTICALLY
+            before judging. Candidates failing any rule are removed from the
+            packet and listed under 'knocked_out' with reasons (never silently
+            dropped). Supported keys: min_years_experience (float),
+            required_skills (list, ALL must appear), any_of_skills (list, at
+            least one). These use heuristic field extraction, so tell the
+            recruiter knocked-out borderline cases are worth a manual look.
 
     Returns a judging packet: the JD, the scoring rubric, and a list of
     candidates each with filename and extracted text."""
@@ -257,18 +308,30 @@ def screen_resumes(
             "note": "No readable resumes to screen in that folder.",
         }
 
-    if len(ok_records) > SINGLE_STAGE_MAX:
+    passed, knocked_out, ko_warnings = _partition_knockouts(ok_records, knockouts)
+    if not passed:
+        packet = {
+            "ok": True,
+            "candidate_count": 0,
+            "candidates": [],
+            "parse_failures": failures,
+            "note": "All readable resumes were removed by the knockout rules.",
+        }
+        return _add_knockout_meta(packet, knockouts, knocked_out, ko_warnings)
+
+    if len(passed) > SINGLE_STAGE_MAX:
         return {
             "ok": False,
             "error": (
-                f"This folder has {len(ok_records)} readable resumes, which is "
-                f"too many to screen in one packet (limit {SINGLE_STAGE_MAX}). "
-                "Use screen_resumes_bulk, which pre-filters the pile first."
+                f"This folder has {len(passed)} readable resumes (after "
+                f"knockouts), which is too many to screen in one packet (limit "
+                f"{SINGLE_STAGE_MAX}). Use screen_resumes_bulk, which "
+                "pre-filters the pile first."
             ),
-            "candidate_count": len(ok_records),
+            "candidate_count": len(passed),
         }
 
-    candidates, id_map = _build_candidates(ok_records, anonymize)
+    candidates, id_map = _build_candidates(passed, anonymize)
     effective_top_k, top_k_note = _clamp_top_k(top_k, len(candidates))
     packet = {
         "ok": True,
@@ -281,7 +344,8 @@ def screen_resumes(
     }
     if top_k_note:
         packet["top_k_note"] = top_k_note
-    return _add_anonymization_meta(packet, id_map)
+    packet = _add_anonymization_meta(packet, id_map)
+    return _add_knockout_meta(packet, knockouts, knocked_out, ko_warnings)
 
 
 @mcp.tool
@@ -291,6 +355,7 @@ def screen_resumes_bulk(
     top_k: int = 5,
     shortlist_size: int = 25,
     anonymize: bool = False,
+    knockouts: dict | None = None,
 ) -> dict:
     """Screen a LARGE folder of resumes (dozens to ~200) against a JD.
 
@@ -313,6 +378,10 @@ def screen_resumes_bulk(
         anonymize: If True, redact names/emails/phones/links/schools from the
             shortlisted texts and label candidates candidate_NN; the packet then
             includes id_map and a fairness_note (see screen_resumes).
+        knockouts: Optional hard-requirement rules (min_years_experience,
+            required_skills, any_of_skills) applied DETERMINISTICALLY before the
+            pre-filter. Failing candidates are removed and listed under
+            'knocked_out' with reasons (never silently dropped). See screen_resumes.
 
     Returns a judging packet (JD, rubric, shortlisted candidates with text and a
     prefilter_score) plus pre-filter metadata: total_extracted, shortlisted,
@@ -342,8 +411,13 @@ def screen_resumes_bulk(
             "note": "No readable resumes to screen in that folder.",
         }
 
-    shortlisted = prefilter(ok_records, job_description, shortlist_size)
-    prefiltered_out = total_extracted - len(shortlisted)
+    # Knockouts run BEFORE the pre-filter — cheaper to shrink the pile first,
+    # and a hard-failed candidate should never occupy a shortlist slot.
+    passed, knocked_out, ko_warnings = _partition_knockouts(ok_records, knockouts)
+    pool = len(passed)
+
+    shortlisted = prefilter(passed, job_description, shortlist_size)
+    prefiltered_out = pool - len(shortlisted)
 
     candidates, id_map = _build_candidates(
         shortlisted, anonymize, include_prefilter=True
@@ -361,16 +435,17 @@ def screen_resumes_bulk(
         "shortlisted": len(shortlisted),
         "prefiltered_out": prefiltered_out,
         "prefilter_note": (
-            f"A local TF-IDF keyword pre-filter narrowed {total_extracted} "
-            f"readable resumes to the {len(shortlisted)} most relevant; "
-            f"{prefiltered_out} were set aside. This is coarse keyword matching, "
-            "not a final judgment — borderline resumes may have been dropped and "
-            "can be reviewed manually."
+            f"A local TF-IDF keyword pre-filter narrowed {pool} resume(s) to "
+            f"the {len(shortlisted)} most relevant; {prefiltered_out} were set "
+            "aside. This is coarse keyword matching, not a final judgment — "
+            "borderline resumes may have been dropped and can be reviewed "
+            "manually."
         ),
     }
     if top_k_note:
         packet["top_k_note"] = top_k_note
-    return _add_anonymization_meta(packet, id_map)
+    packet = _add_anonymization_meta(packet, id_map)
+    return _add_knockout_meta(packet, knockouts, knocked_out, ko_warnings)
 
 
 @mcp.tool
@@ -464,6 +539,7 @@ def rerank(
     top_k: int = 5,
     shortlist_size: int = 25,
     anonymize: bool = False,
+    knockouts: dict | None = None,
 ) -> dict:
     """Re-screen with an adjusted priority. 'emphasis' is a free-text
     instruction like 'weight cloud/AWS experience more heavily' or 'prioritize
@@ -480,6 +556,8 @@ def rerank(
         shortlist_size: How many resumes survive the pre-filter (default 25).
         anonymize: If True, redact identity and label candidates candidate_NN
             (see screen_resumes); passed through to the underlying screen.
+        knockouts: Optional hard-requirement rules (see screen_resumes); applied
+            to the same pile before re-ranking.
 
     Reuses the extraction cache, so re-ranks are fast."""
     log.info("rerank called: emphasis=%r (anonymize=%s)", emphasis, anonymize)
@@ -495,7 +573,7 @@ def rerank(
     biased_jd = f"{job_description}\n\nEMPHASIS: {emphasis}"
     packet = screen_resumes_bulk(
         folder, biased_jd, top_k=top_k, shortlist_size=shortlist_size,
-        anonymize=anonymize,
+        anonymize=anonymize, knockouts=knockouts,
     )
     if not packet.get("ok"):
         return packet
