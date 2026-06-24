@@ -1,0 +1,27 @@
+[project]
+name = "resume-screener-mcp"
+version = "0.1.0"
+description = "MCP server that screens a folder of resumes against a job description for Claude Code."
+requires-python = ">=3.11"
+dependencies = [
+    "fastmcp",
+    "pypdf",
+    "python-docx",
+    "scikit-learn",
+]
+
+[project.scripts]
+resume-screener-mcp = "resume_screener.server:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/resume_screener"]
+
+[dependency-groups]
+dev = [
+    "pytest",
+    "reportlab",
+]

@@ -1,0 +1,15 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# uv / venv (commit uv.lock for reproducible installs)
+.venv/
+
+# Generated test data (regenerate with tests/generate_samples.py)
+tests/bulk_resumes/
+
+# OS
+.DS_Store
+Thumbs.db
