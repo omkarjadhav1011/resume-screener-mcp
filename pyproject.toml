@@ -11,6 +11,15 @@ dependencies = [
     "openpyxl",
 ]
 
+[project.optional-dependencies]
+# OCR is optional: `pip install 'resume-screener-mcp[ocr]'` (or uvx --with).
+# Also requires the system binaries Tesseract (OCR engine) and Poppler (PDF
+# rendering). Without these, scanned PDFs are reported as unreadable as before.
+ocr = [
+    "pytesseract",
+    "pdf2image",
+]
+
 [project.scripts]
 resume-screener-mcp = "resume_screener.server:main"
 

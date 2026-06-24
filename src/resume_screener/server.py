@@ -7,6 +7,7 @@ from fastmcp import FastMCP
 
 from resume_screener.anonymize import anonymize_text
 from resume_screener.collect import collect_resumes
+from resume_screener.dedup import find_duplicates
 from resume_screener.email_drafts import (
     TEMPLATES,
     render_draft,
@@ -249,6 +250,9 @@ def list_resumes(folder: str) -> dict:
         "parsed": len(ok_records),
         "failed": failed,
         "files": files,
+        # Likely duplicates flagged for review (same email / identical / near-
+        # identical text). Empty when none. Never auto-removed.
+        "duplicate_groups": find_duplicates(ok_records),
     }
 
 
@@ -679,6 +683,33 @@ def export_shortlist(
         "rows": len(rows),
         "format": fmt,
         "enriched": bool(folder),
+    }
+
+
+@mcp.tool
+def find_duplicate_candidates(folder: str) -> dict:
+    """Find likely duplicate candidates in a folder — the same person appearing
+    more than once (re-applied, or a lightly-edited resume under a new filename).
+
+    Detection is deterministic and local: same email, identical text, or
+    near-identical text. This FLAGS groups for the recruiter to review — it never
+    removes or merges anyone. Use when the recruiter asks about duplicates, or
+    before screening a pile that may contain re-submissions.
+
+    Args:
+        folder: Absolute path to the folder of resumes.
+
+    Returns {ok, folder, duplicate_groups:[{members,reason}], group_count}."""
+    log.info("find_duplicate_candidates called: %s", folder)
+    ok_records, _failed, error = _gather_resumes(folder)
+    if error:
+        return {"ok": False, "error": error}
+    groups = find_duplicates(ok_records)
+    return {
+        "ok": True,
+        "folder": folder,
+        "duplicate_groups": groups,
+        "group_count": len(groups),
     }
 
 
