@@ -15,6 +15,7 @@ from resume_screener.email_drafts import (
 from resume_screener.export import WRITERS
 from resume_screener.extractor import extract_resume, find_resume_files
 from resume_screener.knockout import apply_knockouts
+from resume_screener.mailer import send_drafts
 from resume_screener.prefilter import prefilter
 
 # Logs go to STDERR by default — NEVER stdout. Stdout is the MCP transport;
@@ -816,6 +817,31 @@ def draft_emails(dest_folder: str, emails: list[dict]) -> dict:
     if errors:
         result["errors"] = errors
     return result
+
+
+@mcp.tool
+def send_emails(
+    dest_folder: str, dry_run: bool = True, confirm: bool = False
+) -> dict:
+    """Send the email drafts in dest_folder/drafts/ over SMTP.
+
+    SAFETY: dry_run is TRUE by default and previews every email WITHOUT sending.
+    To actually send you MUST pass dry_run=False AND confirm=True, and you must
+    ONLY do that after showing the recruiter the dry-run preview and getting their
+    explicit approval. Never send on your own initiative. Credentials come from
+    env vars (SMTP_HOST/PORT/USER/PASS, MAIL_FROM); if they're unset this returns
+    a clear error, never a crash. Every send is logged to dest_folder/send_log.json.
+
+    Args:
+        dest_folder: The folder whose drafts/ subfolder holds the .eml files
+            (from draft_emails).
+        dry_run: Preview only (default True). Sends nothing.
+        confirm: Must be True (with dry_run=False) to actually send.
+
+    Returns the dry-run preview, or per-recipient send results + the log path."""
+    log.info("send_emails called: %s (dry_run=%s, confirm=%s)",
+             dest_folder, dry_run, confirm)
+    return send_drafts(dest_folder, dry_run=dry_run, confirm=confirm)
 
 
 def main() -> None:
