@@ -20,6 +20,7 @@ import unicodedata
 from pypdf import PdfReader
 
 from resume_screener.fields import parse_fields
+from resume_screener.ocr import ocr_available, ocr_pdf
 
 # Below this many characters, normalized text is treated as "no real text"
 # (almost always a scanned/image PDF or an effectively empty file). OCR is out
@@ -142,8 +143,25 @@ def extract_resume(path: str) -> dict:
 
     clean = normalize_text(text)
     if len(clean) < MIN_TEXT_CHARS:
+        # Likely a scanned/image PDF. Try OCR as a best-effort fallback — but
+        # only for PDFs and only when OCR is actually available (Phase U2).
+        if ext == ".pdf" and ocr_available():
+            ocr_text, ocr_err = ocr_pdf(path)
+            ocr_clean = normalize_text(ocr_text)
+            if not ocr_err and len(ocr_clean) >= MIN_TEXT_CHARS:
+                record["text"] = ocr_clean
+                record["char_count"] = len(ocr_clean)
+                record["ok"] = True
+                record["extracted_via"] = "ocr"  # honest: OCR text is noisier
+                record["fields"] = parse_fields(ocr_clean)
+                return record
+            record["error"] = (
+                "no extractable text (OCR attempted but found little or none — "
+                "likely a blank or non-text image)"
+            )
+            return record
         record["error"] = (
-            "no extractable text (likely scanned/image PDF — OCR not supported)"
+            "no extractable text (likely scanned/image PDF — OCR not available)"
         )
         return record
 
