@@ -7,6 +7,11 @@ from fastmcp import FastMCP
 
 from resume_screener.anonymize import anonymize_text
 from resume_screener.collect import collect_resumes
+from resume_screener.email_drafts import (
+    TEMPLATES,
+    render_draft,
+    write_draft_file,
+)
 from resume_screener.export import WRITERS
 from resume_screener.extractor import extract_resume, find_resume_files
 from resume_screener.knockout import apply_knockouts
@@ -717,6 +722,100 @@ def collect_selected(
         dest_folder = os.path.join(folder, "selected", label)
 
     return collect_resumes(folder, filenames, dest_folder)
+
+
+@mcp.tool
+def get_email_templates() -> dict:
+    """Return the starter email templates so YOU (Claude Code) can personalize
+    them per candidate before drafting. Each template lists its subject, body,
+    and placeholders ($name style). Personalize the wording from the candidate's
+    resume + JD + outcome, then call draft_emails with the final subject/body
+    (or pass template + variables to draft_emails to render a starter).
+
+    Templates: interview_invite, rejection (sensitive — always have the recruiter
+    review before sending), request_info."""
+    log.info("get_email_templates called")
+    return {"ok": True, "templates": TEMPLATES}
+
+
+@mcp.tool
+def draft_emails(dest_folder: str, emails: list[dict]) -> dict:
+    """Write editable email drafts (one .eml file per candidate) into
+    dest_folder/drafts/. Call AFTER collect_selected. YOU (Claude Code) craft the
+    wording per candidate; the server only writes the files. The recruiter then
+    EDITS these files on disk and reviews them before any send (U10 reads them
+    back, so edits win).
+
+    Args:
+        dest_folder: The selected-candidates folder (from collect_selected). The
+            drafts/ subfolder is created inside it.
+        emails: One object per candidate. Provide EITHER final wording
+            {"filename", "to", "subject", "body"} OR a starter to render
+            {"filename", "to", "template", "variables": {...}}. 'to' is the
+            recipient email; a candidate with no 'to' is reported in
+            missing_email, never silently skipped.
+
+    Returns {ok, drafts_dir, written:[{filename,to,path}], missing_email, count}."""
+    log.info("draft_emails called: %s (%s rows)", dest_folder,
+             len(emails) if isinstance(emails, list) else -1)
+
+    if not emails or not isinstance(emails, list):
+        return {"ok": False, "error": "Provide a non-empty list of emails to draft."}
+
+    drafts_dir = os.path.join(os.path.abspath(dest_folder), "drafts")
+    try:
+        os.makedirs(drafts_dir, exist_ok=True)
+    except Exception as exc:
+        return {
+            "ok": False,
+            "error": f"Couldn't create the drafts folder ({type(exc).__name__}): {drafts_dir}",
+        }
+
+    written: list[dict] = []
+    missing_email: list[str] = []
+    errors: list[dict] = []
+    for i, e in enumerate(emails, 1):
+        if not isinstance(e, dict):
+            continue
+        to_addr = e.get("to")
+        label = e.get("filename") or e.get("to") or f"draft_{i}"
+        if not to_addr:
+            missing_email.append(e.get("filename") or "(unknown)")
+            continue
+
+        # Final wording wins; otherwise render a starter template.
+        subject = e.get("subject")
+        body = e.get("body")
+        if (subject is None or body is None) and e.get("template"):
+            rendered = render_draft(e["template"], e.get("variables") or {})
+            if not rendered["ok"]:
+                errors.append({"filename": label, "error": rendered["error"]})
+                continue
+            subject = subject if subject is not None else rendered["subject"]
+            body = body if body is not None else rendered["body"]
+        subject = subject or ""
+        body = body or ""
+
+        base = os.path.splitext(os.path.basename(label))[0]
+        try:
+            path = write_draft_file(
+                to_addr, subject, body, os.path.join(drafts_dir, base + ".eml")
+            )
+        except Exception as exc:
+            errors.append({"filename": label, "error": type(exc).__name__})
+            continue
+        written.append({"filename": e.get("filename"), "to": to_addr, "path": path})
+
+    result = {
+        "ok": True,
+        "drafts_dir": drafts_dir,
+        "written": written,
+        "missing_email": missing_email,
+        "count": len(written),
+    }
+    if errors:
+        result["errors"] = errors
+    return result
 
 
 def main() -> None:
