@@ -806,6 +806,7 @@ def draft_emails(dest_folder: str, emails: list[dict]) -> dict:
     written: list[dict] = []
     missing_email: list[str] = []
     errors: list[dict] = []
+    used_basenames: set[str] = set()  # prevent silent overwrite on stem collisions
     for i, e in enumerate(emails, 1):
         if not isinstance(e, dict):
             continue
@@ -828,10 +829,18 @@ def draft_emails(dest_folder: str, emails: list[dict]) -> dict:
         subject = subject or ""
         body = body or ""
 
-        base = os.path.splitext(os.path.basename(label))[0]
+        # Unique draft filename — two selected resumes sharing a stem (alice.pdf
+        # and alice.docx) must NOT overwrite each other's draft (silent loss).
+        base = os.path.splitext(os.path.basename(label))[0] or f"draft_{i}"
+        unique = base
+        k = 2
+        while unique in used_basenames:
+            unique = f"{base}_{k}"
+            k += 1
+        used_basenames.add(unique)
         try:
             path = write_draft_file(
-                to_addr, subject, body, os.path.join(drafts_dir, base + ".eml")
+                to_addr, subject, body, os.path.join(drafts_dir, unique + ".eml")
             )
         except Exception as exc:
             errors.append({"filename": label, "error": type(exc).__name__})

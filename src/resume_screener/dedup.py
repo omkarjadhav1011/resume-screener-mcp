@@ -9,22 +9,26 @@ anyone (the recruiter decides).
 Three signals, combined via union-find so a group can be linked by any of them:
   1. Same email (from parsed fields) — a near-certain duplicate.
   2. Identical normalized text — an exact re-submission (cheap hash-equality).
-  3. Near-identical text — difflib similarity above a threshold, with cheap gates
-     (length ratio, quick_ratio) first so it stays affordable at ~200 files.
+  3. Near-identical text — token-set Jaccard above a threshold. O(set-ops) per
+     pair, so it stays fast even on a pile of many near-duplicates (~200 files).
 
 Pure, deterministic, never raises.
 """
 
 from __future__ import annotations
 
-import difflib
 import re
 from itertools import combinations
 
-# Texts at/above this similarity ratio are flagged as near-duplicates.
-NEAR_THRESHOLD = 0.90
-# Skip pairs whose lengths differ by more than this (cheap pre-gate).
-_LEN_RATIO_GATE = 0.8
+# Token-set Jaccard at/above this is flagged as a near-duplicate. Jaccard
+# (|A∩B|/|A∪B| over the word sets) is a standard near-dup measure — order- and
+# frequency-insensitive, O(set-ops) per pair (no O(n*m) char matching), and far
+# more discriminative for natural-language text than character overlap. Two
+# distinct same-field resumes share tech terms but differ in companies/projects/
+# numbers (Jaccard ~0.2-0.4); a re-submitted resume scores ~0.85+.
+NEAR_THRESHOLD = 0.75
+
+_WORD_RE = re.compile(r"[a-z0-9]+")
 
 
 def _norm_key(text: str) -> str:
@@ -37,7 +41,8 @@ def find_duplicates(records: list[dict], near_threshold: float = NEAR_THRESHOLD)
 
     `records` are extract_resume records (uses fields.email and text). Only groups
     of 2+ are returned; singletons are omitted. Deterministic (sorted output).
-    Never raises."""
+    `near_threshold` is the token-set Jaccard cutoff for near-duplicates. Never
+    raises."""
     n = len(records)
     if n < 2:
         return []
@@ -80,29 +85,25 @@ def find_duplicates(records: list[dict], near_threshold: float = NEAR_THRESHOLD)
                 union(a, b)
                 edges.append((a, b, "identical resume text"))
 
-    # 3. Near-identical text — only for pairs not already grouped, with cheap gates.
-    texts = [r.get("text", "") or "" for r in records]
+    # 3. Near-identical text via token-set Jaccard — for pairs not already grouped.
+    # O(set-ops) per pair, so even a pile of many near-duplicates stays fast (no
+    # O(n*m) char matching that could blow up to minutes on similar text).
+    token_sets = [set(_WORD_RE.findall((r.get("text", "") or "").lower())) for r in records]
     for a, b in combinations(range(n), 2):
         if find(a) == find(b):
             continue
-        ta, tb = texts[a], texts[b]
-        if not ta or not tb:
+        sa, sb = token_sets[a], token_sets[b]
+        if not sa or not sb:
             continue
-        la, lb = len(ta), len(tb)
-        if min(la, lb) / max(la, lb) < _LEN_RATIO_GATE:
+        inter = len(sa & sb)
+        if inter == 0:
             continue
-        # autojunk=False is ESSENTIAL here: difflib's autojunk heuristic treats
-        # characters appearing in >1% of a >200-char sequence as junk, which for
-        # resume-length text means nearly every character — collapsing ratio() to
-        # near-zero on exactly the long text we want to compare.
-        sm = difflib.SequenceMatcher(None, ta, tb, autojunk=False)
-        # real_quick_ratio()/quick_ratio() are cheap upper bounds on ratio().
-        if sm.real_quick_ratio() < near_threshold or sm.quick_ratio() < near_threshold:
-            continue
-        ratio = sm.ratio()
-        if ratio >= near_threshold:
+        jaccard = inter / len(sa | sb)
+        if jaccard >= near_threshold:
             union(a, b)
-            edges.append((a, b, f"near-identical text ({int(round(ratio * 100))}% similar)"))
+            edges.append(
+                (a, b, f"near-identical text ({int(round(jaccard * 100))}% word overlap)")
+            )
 
     # Assemble groups of size >= 2.
     groups: dict[int, list[int]] = {}

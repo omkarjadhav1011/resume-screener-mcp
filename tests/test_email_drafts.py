@@ -103,3 +103,18 @@ def test_draft_emails_template_path(tmp_path):
 
 def test_draft_emails_empty_list(tmp_path):
     assert draft_emails(str(tmp_path / "f"), [])["ok"] is False
+
+
+def test_draft_emails_stem_collision_no_overwrite(tmp_path):
+    # Two selected resumes sharing a stem must produce two distinct drafts,
+    # never silently overwrite each other.
+    emails = [
+        {"filename": "alice.pdf", "to": "a@x.com", "subject": "s1", "body": "b1"},
+        {"filename": "alice.docx", "to": "a2@x.com", "subject": "s2", "body": "b2"},
+    ]
+    out = draft_emails(str(tmp_path / "f"), emails)
+    assert out["count"] == 2
+    paths = {w["path"] for w in out["written"]}
+    assert len(paths) == 2  # distinct files, nothing clobbered
+    for p in paths:
+        assert os.path.isfile(p)

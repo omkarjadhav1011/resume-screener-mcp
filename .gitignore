@@ -13,3 +13,8 @@ tests/bulk_resumes/
 # OS
 .DS_Store
 Thumbs.db
+*.eml
+*.md
+*.pdf
+*.doc
+*.docx
